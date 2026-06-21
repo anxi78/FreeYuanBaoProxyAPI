@@ -1,18 +1,19 @@
-# yb - 元宝 Bot 守护进程
+# FreeYuanBaoProxyAPI - 元宝 Bot 代理守护进程
 
-基于 WebSocket 的元宝 Bot 守护进程，提供 OpenAI 兼容的 HTTP API。
+基于 WebSocket 的元宝 Bot 代理守护进程，提供 OpenAI 兼容的 HTTP API。
 
 ## 功能
 
 - 连接元宝 Bot WebSocket 服务
 - 监听群消息，自动回复 @元宝 的请求
-- 提供 OpenAI 格式的 HTTP API (`/v1/chat/completions`)
+- 提供 OpenAI 格式的 HTTP API (`/v1/chat/completions`, `/v1/models`)
 - 支持多轮对话
+- API Key 鉴权（可选）
 
 ## 使用
 
 ```bash
-python yb/main.py
+python main.py
 ```
 
 ## 配置
