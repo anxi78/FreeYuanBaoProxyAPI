@@ -12,7 +12,7 @@
 ## 使用
 
 ```bash
-python yb/yb.py
+python yb/main.py
 ```
 
 ## 配置
