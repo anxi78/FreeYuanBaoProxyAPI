@@ -14,7 +14,7 @@ yb/yb.py - 元宝 Bot 守护进程 (OpenAI 兼容接口)
     GROUP_CODE   - 目标群号
     YUANBAO_USER_ID - 元宝 AI 的用户 ID
     YUANBAO_NICK    - 元宝 AI 的昵称
-    PORT         - 监听端口 (默认 5000)
+    PORT         - 监听端口 (默认 35500)
     debug        - true 时打印所有原始 WebSocket 消息和调试信息
 """
 
@@ -33,12 +33,6 @@ import string
 # ── 日志配置 ──
 logger = logging.getLogger('yb')
 logger.setLevel(logging.INFO)
-_fh = logging.FileHandler(
-    os.path.join(os.path.dirname(__file__), 'yb.log'),
-    encoding='utf-8'
-)
-_fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-logger.addHandler(_fh)
 _sh = logging.StreamHandler(sys.stdout)
 _sh.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
 logger.addHandler(_sh)
@@ -57,7 +51,7 @@ YUANBAO_USER_ID = _cfg.get('YUANBAO_USER_ID',
                                   'szUvRH8s4ekettawNjDREmAG4W7h+Lhb8Sy9tq/otZU=')
 YUANBAO_NICK = _cfg.get('YUANBAO_NICK', '元宝')
 DEBUG_MODE = _cfg.get('debug', False)
-SERVER_PORT = int(_cfg.get('PORT', 5000))
+SERVER_PORT = int(_cfg.get('PORT', 35500))
 API_KEY = _cfg.get('API_KEY', '')
 
 # ── 协议常量 ──
@@ -631,7 +625,7 @@ class YBDaemon:
         self._pending_future = future
 
         # 发送 @元宝 消息
-        full = f"@{YUANBAO_NICK} {user_msg}"
+        full = user_msg
         await self.client.send_group_message(GROUP_CODE, full,
             at_user_id=YUANBAO_USER_ID, at_nickname=YUANBAO_NICK)
         logger.info(f"已发送请求: {user_msg[:60]}")
@@ -800,12 +794,34 @@ class YBDaemon:
 
             last_user_msg = messages[last_user_idx].get('content', '')
 
-            # 构建对话历史（最后一条 user 消息之前的所有消息）
+            # 构建对话历史（跳过最后一条 user 消息，但保留其后的 tool_calls/tool 消息）
             history_lines = []
-            for m in messages[:last_user_idx]:
+            for i, m in enumerate(messages):
+                if i == last_user_idx:
+                    continue  # 跳过最后一条 user，作为当前问题
                 role = m.get('role', 'user')
                 content = m.get('content', '')
-                history_lines.append(f"{role}: {content}")
+                if role == 'assistant' and 'tool_calls' in m:
+                    # assistant 消息中带有工具调用
+                    tc_parts = []
+                    for tc in m['tool_calls']:
+                        fn = tc.get('function', {})
+                        tc_parts.append(
+                            f"call {fn.get('name', '?')}"
+                            f"({fn.get('arguments', '{}')})"
+                        )
+                    history_lines.append(
+                        f"assistant: [工具调用] {', '.join(tc_parts)}"
+                        + (f" 回复: {content}" if content else "")
+                    )
+                elif role == 'tool':
+                    # 工具返回结果
+                    call_id = m.get('tool_call_id', '')
+                    history_lines.append(
+                        f"tool({call_id}): {content}"
+                    )
+                else:
+                    history_lines.append(f"{role}: {content}")
 
             if history_lines:
                 # 有多轮对话历史：历史 + 分隔线 + 最后一条 user 消息
@@ -815,6 +831,50 @@ class YBDaemon:
             else:
                 # 单轮对话：直接用消息内容
                 user_msg = last_user_msg
+
+            # ── 工具调用支持：如果有 tools 参数，构造 JSON 格式工具调用请求 ──
+            tools = req_body.get('tools', [])
+            tool_choice = req_body.get('tool_choice', 'auto')
+            has_tools = bool(tools and tool_choice != 'none')
+            if has_tools:
+                tool_defs = []
+                for t in tools:
+                    func = t.get('function', {})
+                    tool_defs.append({
+                        'name': func.get('name', 'unknown'),
+                        'description': func.get('description', ''),
+                        'parameters': func.get('parameters', {})
+                    })
+                # 构建特定的 JSON 请求格式，让元宝理解并返回 JSON 格式的工具调用
+                tool_call_request = {
+                    'type': 'tool_call_request',
+                    'tools': tool_defs,
+                    'user_message': last_user_msg,
+                    'response_format': {
+                        'type': 'json_object',
+                        'schema': {
+                            'tool_calls': [
+                                {
+                                    'id': 'string, e.g. "call_abc123"',
+                                    'type': '"function"',
+                                    'function': {
+                                        'name': 'string, the tool name to call',
+                                        'arguments': {'param1': 'value1'}
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+                tool_json_str = json.dumps(tool_call_request, ensure_ascii=False, indent=2)
+                user_msg = (
+                    f'【工具调用请求】\n'
+                    f'请根据用户问题从可用工具中选择一个，并严格按以下 JSON 格式回复（只返回 JSON，不要包含其他任何内容）：\n\n'
+                    f'可用工具定义：\n'
+                    f'{tool_json_str}\n\n'
+                    f'用户问题：{last_user_msg}\n\n'
+                    f'请仅返回 JSON 格式：{{"tool_calls": [{{"id": "call_xxx", "type": "function", "function": {{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}}}]}}'
+                )
 
             if not self.client.connected:
                 resp = self._http_response(503, 'Unavailable',
@@ -827,28 +887,100 @@ class YBDaemon:
             # 发送到群聊并等待回复
             try:
                 reply = await self.send_and_wait(user_msg)
-                resp_body = {
-                    'id': f'chatcmpl-{uuid.uuid4().hex}',
-                    'object': 'chat.completion',
-                    'created': int(time.time()),
-                    'model': 'yuanbao',
-                    'choices': [{
-                        'index': 0,
-                        'message': {
-                            'role': 'assistant',
-                            'content': reply
-                        },
-                        'finish_reason': 'stop'
-                    }],
-                    'usage': {
-                        'prompt_tokens': len(user_msg),
-                        'completion_tokens': len(reply),
-                        'total_tokens': len(user_msg) + len(reply)
+
+                # ── 尝试解析工具调用 JSON 响应（只有请求中包含 tools 时才解析）──
+                tool_calls = None
+                if has_tools:
+                    try:
+                        text = reply.strip()
+                        # 如果被 ```json ... ``` 包裹，提取中间内容
+                        if text.startswith('```'):
+                            lines = text.split('\n')
+                            cleaned = []
+                            in_code = False
+                            for line in lines:
+                                if line.strip().startswith('```'):
+                                    in_code = not in_code
+                                    continue
+                                if in_code:
+                                    cleaned.append(line)
+                            text = '\n'.join(cleaned).strip()
+
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and 'tool_calls' in parsed:
+                            raw_calls = parsed['tool_calls']
+                            if isinstance(raw_calls, list) and len(raw_calls) > 0:
+                                valid_calls = []
+                                for tc in raw_calls:
+                                    if (isinstance(tc, dict)
+                                            and tc.get('type') == 'function'
+                                            and tc.get('function', {}).get('name')):
+                                        func = tc['function']
+                                        args = func.get('arguments', {})
+                                        args_str = (json.dumps(args, ensure_ascii=False)
+                                                    if isinstance(args, dict) else str(args))
+                                        valid_calls.append({
+                                            'id': tc.get('id', f'call_{uuid.uuid4().hex[:8]}'),
+                                            'type': 'function',
+                                            'function': {
+                                                'name': func['name'],
+                                                'arguments': args_str
+                                            }
+                                        })
+                                if valid_calls:
+                                    tool_calls = valid_calls
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+
+                if tool_calls:
+                    # 工具调用：返回 tool_calls 格式
+                    resp_body = {
+                        'id': f'chatcmpl-{uuid.uuid4().hex}',
+                        'object': 'chat.completion',
+                        'created': int(time.time()),
+                        'model': 'yuanbao',
+                        'choices': [{
+                            'index': 0,
+                            'message': {
+                                'role': 'assistant',
+                                'content': None,
+                                'tool_calls': tool_calls
+                            },
+                            'finish_reason': 'tool_calls'
+                        }],
+                        'usage': {
+                            'prompt_tokens': len(user_msg),
+                            'completion_tokens': len(reply),
+                            'total_tokens': len(user_msg) + len(reply)
+                        }
                     }
-                }
+                    logger.info(f"工具调用成功: "
+                                f"{json.dumps(tool_calls, ensure_ascii=False)[:100]}")
+                else:
+                    # 普通文本回复
+                    resp_body = {
+                        'id': f'chatcmpl-{uuid.uuid4().hex}',
+                        'object': 'chat.completion',
+                        'created': int(time.time()),
+                        'model': 'yuanbao',
+                        'choices': [{
+                            'index': 0,
+                            'message': {
+                                'role': 'assistant',
+                                'content': reply
+                            },
+                            'finish_reason': 'stop'
+                        }],
+                        'usage': {
+                            'prompt_tokens': len(user_msg),
+                            'completion_tokens': len(reply),
+                            'total_tokens': len(user_msg) + len(reply)
+                        }
+                    }
+                    logger.info(f"回复成功: {reply[:60]}")
+
                 resp = self._http_response(200, 'OK', resp_body)
                 writer.write(resp)
-                logger.info(f"回复成功: {reply[:60]}")
             except TimeoutError:
                 resp = self._http_response(504, 'Gateway Timeout',
                                            {'error': '元宝回复超时'})
@@ -881,13 +1013,13 @@ class YBDaemon:
         # 3. 启动接收循环
         asyncio.create_task(self._receive_loop())
 
-        # 4. 等待片刻后发送测试消息
+        # 4. 等待片刻后发送测试消息，确认元宝在线后再启动 HTTP 服务器
         await asyncio.sleep(3)
-        await self.client.send_group_message(
-            GROUP_CODE, f"@{YUANBAO_NICK} 系统上线测试",
-            at_user_id=YUANBAO_USER_ID, at_nickname=YUANBAO_NICK
-        )
-        logger.info("测试消息已发送")
+        try:
+            test_reply = await self.send_and_wait("系统上线测试")
+            logger.info(f"元宝已就绪: {test_reply[:60]}")
+        except Exception as e:
+            logger.warning(f"元宝未响应，仍继续启动: {e}")
 
         # 5. 启动 HTTP 服务器
         self._http_server = await asyncio.start_server(
