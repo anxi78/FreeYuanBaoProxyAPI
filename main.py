@@ -154,6 +154,22 @@ class SimpleProtobufCodec:
         return elem
 
     @staticmethod
+    def encode_tim_file_elem(url: str, uuid: str = "", file_size: int = 0, file_name: str = "") -> bytes:
+        """编码 TIMFileElem 文件消息元素"""
+        msg_content = b''
+        if uuid:
+            msg_content += SimpleProtobufCodec.encode_string(2, uuid)
+        msg_content += SimpleProtobufCodec.encode_string(10, url)
+        if file_size:
+            msg_content += bytes([(11 << 3) | 0]) + SimpleProtobufCodec.encode_varint(file_size)
+        if file_name:
+            msg_content += SimpleProtobufCodec.encode_string(12, file_name)
+        elem = b''
+        elem += SimpleProtobufCodec.encode_string(1, "TIMFileElem")
+        elem += SimpleProtobufCodec.encode_message_field(2, msg_content)
+        return elem
+
+    @staticmethod
     def encode_send_group_msg_req(msg_id: str, group_code: str,
                                    from_account: str, text: str,
                                    at_user_id: str = "", at_nickname: str = "") -> bytes:
@@ -523,6 +539,168 @@ class YuanbaoClient:
         logger.info(f"群消息已发送: {text[:60]}")
         return True
 
+    # ── 文件发送支持 ──
+
+    def _get_upload_info(self, filename: str, file_id: str) -> dict | None:
+        """获取文件上传凭证"""
+        import requests
+        if not self.bot_id or not self.token:
+            logger.warning("获取上传凭证失败: 未获取到 bot_id 或 token")
+            return None
+        if not file_id:
+            file_id = uuid.uuid4().hex
+        url = f"https://{API_DOMAIN}/api/resource/genUploadInfo"
+        headers = {
+            "Content-Type": "application/json",
+            "X-ID": self.bot_id,
+            "X-Token": self.token,
+            "X-Source": "web",
+            "X-AppVersion": "2.0.1",
+            "X-OperationSystem": "Linux",
+            "X-Instance-Id": "99",
+        }
+        body = {
+            "fileName": filename,
+            "fileId": file_id,
+            "docFrom": "localDoc",
+            "docOpenId": ""
+        }
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=30)
+            result = response.json()
+            if result.get("code", 0) == 0:
+                return result.get("data", result)
+            else:
+                logger.warning(f"获取上传凭证失败: {result}")
+                return None
+        except Exception as e:
+            logger.warning(f"获取上传凭证错误: {e}")
+            return None
+
+    def _upload_to_cos(self, config: dict, data: bytes, filename: str) -> str | None:
+        """上传文件到腾讯云 COS"""
+        try:
+            from qcloud_cos import CosConfig, CosS3Client
+            cos_config = CosConfig(
+                Region=config["region"],
+                SecretId=config["encryptTmpSecretId"],
+                SecretKey=config["encryptTmpSecretKey"],
+                Token=config["encryptToken"],
+            )
+            client = CosS3Client(cos_config)
+            client.put_object(
+                Bucket=config["bucketName"],
+                Body=data,
+                Key=config["location"],
+                ContentType="application/octet-stream",
+            )
+            return config.get("resourceUrl",
+                              f"https://{config['bucketName']}.cos.{config['region']}.myqcloud.com{config['location']}")
+        except ImportError:
+            # 手动签名回退
+            secret_id = config.get("encryptTmpSecretId", "")
+            secret_key = config.get("encryptTmpSecretKey", "")
+            security_token = config.get("encryptToken", "")
+            start_time = config.get("startTime", 0)
+            expired_time = config.get("expiredTime", 0)
+            bucket = config.get("bucketName", "")
+            region = config.get("region", "")
+            location = config.get("location", "")
+            key_time = f"{start_time};{expired_time}"
+            sign_key = hmac.new(secret_key.encode(), key_time.encode(), hashlib.sha1).hexdigest()
+            http_string = f"put\n{location}\n\nhost={bucket}.cos.{region}.myqcloud.com\n"
+            string_to_sign = f"sha1\n{key_time}\n{hashlib.sha1(http_string.encode()).hexdigest()}\n"
+            signature = hmac.new(sign_key.encode(), string_to_sign.encode(), hashlib.sha1).hexdigest()
+            authorization = (f"q-sign-algorithm=sha1&q-ak={secret_id}&q-sign-time={key_time}"
+                             f"&q-key-time={key_time}&q-header-list=host&q-url-param-list=&q-signature={signature}")
+            if security_token:
+                authorization += f"&x-cos-security-token={security_token}"
+            upload_url = f"https://{bucket}.cos.{region}.myqcloud.com{location}"
+            headers = {
+                "Host": f"{bucket}.cos.{region}.myqcloud.com",
+                "Authorization": authorization,
+                "Content-Type": "application/octet-stream",
+            }
+            if security_token:
+                headers["x-cos-security-token"] = security_token
+            try:
+                import requests
+                response = requests.put(upload_url, headers=headers, data=data, timeout=60)
+                if response.status_code == 200:
+                    return config.get("resourceUrl", upload_url)
+                else:
+                    logger.warning(f"上传失败: {response.status_code} {response.text[:200]}")
+                    return None
+            except Exception as e:
+                logger.warning(f"上传错误: {e}")
+                return None
+        except Exception as e:
+            logger.warning(f"上传到 COS 失败: {e}")
+            return None
+
+    def _build_file_msg(self, url: str, uuid: str = "", file_size: int = 0, file_name: str = "") -> bytes:
+        """构建文件群消息（TIMFileElem）"""
+        file_elem = self.codec.encode_tim_file_elem(url, uuid, file_size, file_name)
+        data = b''
+        data += self.codec.encode_string(1, self._generate_msg_id())           # msg_id
+        data += self.codec.encode_string(2, GROUP_CODE)                        # group_code
+        data += self.codec.encode_string(3, self.bot_id or "")                 # from_account
+        data += self.codec.encode_string(4, "")                                # to_account（空）
+        data += self.codec.encode_string(5, str(random.randint(1, 999999999))) # random
+        data += self.codec.encode_message_field(6, file_elem)                  # msgBody
+        data += self.codec.encode_string(7, "")                                # refMsgId（空）
+        # 构建 ConnMsg
+        seq_no = self.seq_no
+        self.seq_no += 1
+        msg_id = self._generate_msg_id()
+        head = self.codec.encode_head(
+            CMD_TYPE_REQUEST, "send_group_message", seq_no,
+            msg_id, BIZ_MODULE
+        )
+        return self.codec.encode_conn_msg(head, data)
+
+    async def send_file(self, file_path: str) -> bool:
+        """发送文件消息（COS 上传 + TIMFileElem）"""
+        if not self.connected or not self.ws:
+            logger.warning("发送文件失败: 未连接")
+            return False
+
+        import os.path
+        if not os.path.exists(file_path):
+            logger.warning(f"文件不存在: {file_path}")
+            return False
+
+        try:
+            with open(file_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            logger.warning(f"读取文件失败: {e}")
+            return False
+
+        max_bytes = 20 * 1024 * 1024
+        if len(data) > max_bytes:
+            logger.warning(f"文件过大: {len(data) / 1024 / 1024:.1f} MB > 20 MB")
+            return False
+
+        filename = os.path.basename(file_path)
+        file_id = uuid.uuid4().hex
+        config = self._get_upload_info(filename, file_id)
+        if not config:
+            return False
+
+        url = self._upload_to_cos(config, data, filename)
+        if not url:
+            return False
+
+        try:
+            msg = self._build_file_msg(url, file_id, file_size=len(data), file_name=filename)
+            await self.ws.send(msg)
+            logger.info(f"文件已发送: {filename} ({len(data)} bytes)")
+            return True
+        except Exception as e:
+            logger.warning(f"发送文件失败: {e}")
+            return False
+
     async def _send_ping(self):
         ping_id = self._generate_msg_id()
         head = self.codec.encode_head(
@@ -562,6 +740,14 @@ class YBDaemon:
         self._connected = asyncio.Event()
         self._running = True
         self._http_server = None
+
+        # 启动时清理旧文件
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for fname in ('历史.txt', '工具.txt'):
+            fpath = os.path.join(base_dir, fname)
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                logger.info(f"启动清理: 已删除旧文件 {fname}")
 
     async def _heartbeat_loop(self):
         while self._running and self.client.connected:
@@ -801,42 +987,29 @@ class YBDaemon:
                 writer.close()
                 return
 
-            # 找到最后一条 user 消息的索引
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get('role') == 'user':
-                    last_user_idx = i
-                    break
-
-            if last_user_idx == -1:
+            # 根据最后一条消息的 role 决定前缀
+            last_msg = messages[-1] if messages else None
+            if not last_msg:
                 resp = self._http_response(400, 'Bad Request',
-                                           {'error': 'No user message'})
+                                           {'error': 'No messages'})
                 writer.write(resp)
                 await writer.drain()
                 writer.close()
                 return
 
-            last_user_msg = SimpleProtobufCodec.extract_content_text(
-                messages[last_user_idx].get('content')
+            last_role = last_msg.get('role', 'user')
+            last_content = SimpleProtobufCodec.extract_content_text(
+                last_msg.get('content')
             )
+            if last_role == 'tool':
+                last_line = f"Tool:{last_content}"
+            else:
+                last_line = f"User:{last_content}"
 
             # ── 从静态文件读取历史示例和工具调用示例 ──
             base_dir = os.path.dirname(os.path.abspath(__file__))
             history_file = os.path.join(base_dir, '历史.txt')
             tools_file = os.path.join(base_dir, '工具.txt')
-
-            history_content = ""
-            tools_content = ""
-            try:
-                with open(history_file, 'r', encoding='utf-8') as f:
-                    history_content = f.read().strip()
-            except Exception as e:
-                logger.warning(f"读取历史文件失败: {e}")
-            try:
-                with open(tools_file, 'r', encoding='utf-8') as f:
-                    tools_content = f.read().strip()
-            except Exception as e:
-                logger.warning(f"读取工具文件失败: {e}")
 
             # 保持 has_tools 用于后续工具调用解析
             tools = req_body.get('tools', [])
@@ -851,26 +1024,50 @@ class YBDaemon:
                 writer.close()
                 return
 
-            # 先发送文件内容（不带 @），再 @元宝 发送 System/User 格式消息
+            # 发送文件到群聊（COS 上传 + TIMFileElem），让元宝读取
             try:
+                # 动态生成历史记录文件（对话上下文）
+                history_lines = []
+                for msg in messages:
+                    role = msg.get('role', 'unknown')
+                    content = SimpleProtobufCodec.extract_content_text(msg.get('content', ''))
+                    if content:
+                        history_lines.append(f"{role}: {content}")
+                history_content = '\n'.join(history_lines)
+                with open(history_file, 'w', encoding='utf-8') as f:
+                    f.write(history_content)
+                logger.info(f"已生成 {history_file} ({len(history_content)} bytes)")
+
+                # 生成工具定义文件（如果请求中包含 tools）
+                tools_content = ''
+                if tools:
+                    lines = ['【工具调用请求】', '']
+                    lines.append('请根据用户问题从可用工具中选择一个，并严格按以下 JSON 格式回复（只返回 JSON，不要包含其他任何内容）：')
+                    lines.append('')
+                    lines.append('可用工具定义：')
+                    lines.append('')
+                    lines.append(json.dumps(tools, ensure_ascii=False, indent=2))
+                    lines.append('')
+                    lines.append('请仅返回 JSON 格式：{"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "工具名", "arguments": {"参数名": "参数值"}}}]}')
+                    tools_content = '\n'.join(lines)
+                    with open(tools_file, 'w', encoding='utf-8') as f:
+                        f.write(tools_content)
+                    logger.info(f"已生成 {tools_file} ({len(tools_content)} bytes)")
+
+                # 发送文件后删除
                 if history_content:
-                    await self.client.send_group_message(GROUP_CODE, history_content)
+                    if await self.client.send_file(history_file):
+                        os.remove(history_file)
+                        logger.info(f"已删除: {history_file}")
                     await asyncio.sleep(1)
                 if tools_content:
-                    await self.client.send_group_message(GROUP_CODE, tools_content)
+                    if await self.client.send_file(tools_file):
+                        os.remove(tools_file)
+                        logger.info(f"已删除: {tools_file}")
                     await asyncio.sleep(1)
 
-                # 发送后删除本地文件
-                for fpath in [history_file, tools_file]:
-                    try:
-                        if os.path.exists(fpath):
-                            os.remove(fpath)
-                            logger.info(f"已删除本地文件: {fpath}")
-                    except Exception as e:
-                        logger.warning(f"删除文件失败 {fpath}: {e}")
-
                 # @元宝 发送 System/User 格式消息
-                user_msg = f"System:请读取以上两个文件的内容\nUser:{last_user_msg}"
+                user_msg = f"System:请读取历史.txt和工具.txt（有哪个读哪个），直接回答用户问题，无需告知我已读取\n{last_line}"
                 reply = await self.send_and_wait(user_msg)
 
                 # ── 尝试解析工具调用 JSON 响应（只有请求中包含 tools 时才解析）──
@@ -987,17 +1184,6 @@ class YBDaemon:
 
     async def run(self):
         """启动守护进程"""
-        # 0. 启动时清理残余文件
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        for fname in ['历史.txt', '工具.txt']:
-            fpath = os.path.join(base_dir, fname)
-            try:
-                if os.path.exists(fpath):
-                    os.remove(fpath)
-                    logger.info(f"启动时已清理残余文件: {fname}")
-            except Exception as e:
-                logger.warning(f"启动时清理文件失败 {fname}: {e}")
-
         # 1. 连接 WebSocket
         await self.client.connect()
         self._connected.set()
