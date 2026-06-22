@@ -276,11 +276,11 @@ class SimpleProtobufCodec:
             raw = json.loads(data.decode('utf-8'))
             # JSON 格式直接使用 snake_case 字段名（服务器推送的 JSON 用 snake_case）
             result = {}
-            result['from_account'] = raw.get('from_account', '')
+            result['from_account'] = raw.get('from_account', raw.get('fromAccount', ''))
             result['fromAccount'] = result['from_account']
-            result['group_code'] = raw.get('group_code', '')
+            result['group_code'] = raw.get('group_code', raw.get('groupCode', ''))
             result['groupCode'] = result['group_code']
-            result['msg_id'] = raw.get('msg_id', '')
+            result['msg_id'] = raw.get('msg_id', raw.get('msgId', ''))
             result['msgId'] = result['msg_id']
             # 从 msg_body 数组中提取 TIMTextElem 的文本
             msg_body = raw.get('msg_body', [])
@@ -370,6 +370,26 @@ class SimpleProtobufCodec:
             else:
                 break
         return ''
+
+    @staticmethod
+    def extract_content_text(content) -> str:
+        """从 OpenAI 格式的 content 字段中安全提取纯文本。
+        支持三种格式:
+        - None/缺失 → ''
+        - 字符串 → 原样返回
+        - 数组 [{"type":"text","text":"..."}, ...] → 拼接所有 text 元素
+        """
+        if not content:
+            return ''
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    texts.append(part.get('text', ''))
+            return '\n'.join(texts)
+        return str(content)
 
 
 class YuanbaoClient:
@@ -761,8 +781,12 @@ class YBDaemon:
             # 解析 body
             try:
                 req_body = json.loads(req['body'].decode('utf-8'))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                resp = self._http_response(400, 'Bad Request', {'error': 'Invalid JSON'})
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                body_preview = req['body'][:200].decode('utf-8', errors='replace')
+                resp = self._http_response(400, 'Bad Request', {
+                    'error': f'Invalid JSON: {e}',
+                    'detail': body_preview
+                })
                 writer.write(resp)
                 await writer.drain()
                 writer.close()
@@ -792,7 +816,9 @@ class YBDaemon:
                 writer.close()
                 return
 
-            last_user_msg = messages[last_user_idx].get('content', '')
+            last_user_msg = SimpleProtobufCodec.extract_content_text(
+                messages[last_user_idx].get('content')
+            )
 
             # 构建对话历史（跳过最后一条 user 消息，但保留其后的 tool_calls/tool 消息）
             history_lines = []
@@ -800,9 +826,11 @@ class YBDaemon:
                 if i == last_user_idx:
                     continue  # 跳过最后一条 user，作为当前问题
                 role = m.get('role', 'user')
-                content = m.get('content', '')
+                content = SimpleProtobufCodec.extract_content_text(
+                    m.get('content')
+                )
+                # 优先处理 tool_calls（新格式）
                 if role == 'assistant' and 'tool_calls' in m:
-                    # assistant 消息中带有工具调用
                     tc_parts = []
                     for tc in m['tool_calls']:
                         fn = tc.get('function', {})
@@ -812,6 +840,14 @@ class YBDaemon:
                         )
                     history_lines.append(
                         f"assistant: [工具调用] {', '.join(tc_parts)}"
+                        + (f" 回复: {content}" if content else "")
+                    )
+                elif role == 'assistant' and 'function_call' in m:
+                    # 兼容旧格式 function_call
+                    fn = m['function_call']
+                    history_lines.append(
+                        f"assistant: [函数调用] call {fn.get('name', '?')}"
+                        f"({fn.get('arguments', '{}')})"
                         + (f" 回复: {content}" if content else "")
                     )
                 elif role == 'tool':
