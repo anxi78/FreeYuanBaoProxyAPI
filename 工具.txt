@@ -1,0 +1,86 @@
+【工具调用请求】
+
+请根据用户问题从可用工具中选择一个，并严格按以下 JSON 格式回复（只返回 JSON，不要包含其他任何内容）：
+
+可用工具定义：
+
+{
+
+"type": "tool_call_request",
+
+"tools": [
+
+{
+
+"name": "get_weather",
+
+"description": "获取指定城市的天气",
+
+"parameters": {
+
+"type": "object",
+
+"properties": {
+
+"city": {
+
+"type": "string",
+
+"description": "城市名称"
+
+}
+
+},
+
+"required": [
+
+"city"
+
+]
+
+}
+
+}
+
+],
+
+"user_message": "杭州今天天气怎么样？",
+
+"response_format": {
+
+"type": "json_object",
+
+"schema": {
+
+"tool_calls": [
+
+{
+
+"id": "string, e.g. "call_abc123"",
+
+"type": ""function"",
+
+"function": {
+
+"name": "string, the tool name to call",
+
+"arguments": {
+
+"param1": "value1"
+
+}
+
+}
+
+}
+
+]
+
+}
+
+}
+
+}
+
+
+请仅返回 JSON 格式：{"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "工具名", "arguments": {"参数名": "参数值"}}}]}
