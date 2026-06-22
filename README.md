@@ -12,6 +12,8 @@
   - `POST /v1/chat/completions` — 聊天补全，支持多轮对话
 - **工具调用** — 支持 OpenAI 格式的 `tools` 参数，自动让元宝以 JSON 格式返回工具调用
 - **工具调用历史** — 支持 `messages` 中包含 `role: assistant` 的 `tool_calls` 和 `role: tool` 的消息，保留完整上下文
+- **文件发送** — 将对话历史和工具定义生成为 `历史.txt` / `工具.txt` 文件，通过 COS 上传 + TIMFileElem 发送到群聊，发送后自动删除
+- **智能前缀** — 根据最后一条消息的 `role` 自动决定 System 消息中的前缀：`role: tool` 时用 `Tool:`，否则用 `User:`
 - API Key 鉴权（可选）
 - 无文件日志，仅输出到控制台
 
