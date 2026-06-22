@@ -1,0 +1,5 @@
+assistant: [工具调用] call get_weather({"city":"杭州"})
+
+tool(call_hangzhou_weather): 杭州 今日晴，20~28°C，适合测试。
+
+--- 历史结束 ---

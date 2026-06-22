@@ -820,97 +820,28 @@ class YBDaemon:
                 messages[last_user_idx].get('content')
             )
 
-            # 构建对话历史（跳过最后一条 user 消息，但保留其后的 tool_calls/tool 消息）
-            history_lines = []
-            for i, m in enumerate(messages):
-                if i == last_user_idx:
-                    continue  # 跳过最后一条 user，作为当前问题
-                role = m.get('role', 'user')
-                content = SimpleProtobufCodec.extract_content_text(
-                    m.get('content')
-                )
-                # 优先处理 tool_calls（新格式）
-                if role == 'assistant' and 'tool_calls' in m:
-                    tc_parts = []
-                    for tc in m['tool_calls']:
-                        fn = tc.get('function', {})
-                        tc_parts.append(
-                            f"call {fn.get('name', '?')}"
-                            f"({fn.get('arguments', '{}')})"
-                        )
-                    history_lines.append(
-                        f"assistant: [工具调用] {', '.join(tc_parts)}"
-                        + (f" 回复: {content}" if content else "")
-                    )
-                elif role == 'assistant' and 'function_call' in m:
-                    # 兼容旧格式 function_call
-                    fn = m['function_call']
-                    history_lines.append(
-                        f"assistant: [函数调用] call {fn.get('name', '?')}"
-                        f"({fn.get('arguments', '{}')})"
-                        + (f" 回复: {content}" if content else "")
-                    )
-                elif role == 'tool':
-                    # 工具返回结果
-                    call_id = m.get('tool_call_id', '')
-                    history_lines.append(
-                        f"tool({call_id}): {content}"
-                    )
-                else:
-                    history_lines.append(f"{role}: {content}")
+            # ── 从静态文件读取历史示例和工具调用示例 ──
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            history_file = os.path.join(base_dir, '历史.txt')
+            tools_file = os.path.join(base_dir, '工具.txt')
 
-            if history_lines:
-                # 有多轮对话历史：历史 + 分隔线 + 最后一条 user 消息
-                user_msg = ('\n'.join(history_lines)
-                            + '\n--- 历史结束 ---\n'
-                            + f"user: {last_user_msg}")
-            else:
-                # 单轮对话：直接用消息内容
-                user_msg = last_user_msg
+            history_content = ""
+            tools_content = ""
+            try:
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    history_content = f.read().strip()
+            except Exception as e:
+                logger.warning(f"读取历史文件失败: {e}")
+            try:
+                with open(tools_file, 'r', encoding='utf-8') as f:
+                    tools_content = f.read().strip()
+            except Exception as e:
+                logger.warning(f"读取工具文件失败: {e}")
 
-            # ── 工具调用支持：如果有 tools 参数，构造 JSON 格式工具调用请求 ──
+            # 保持 has_tools 用于后续工具调用解析
             tools = req_body.get('tools', [])
             tool_choice = req_body.get('tool_choice', 'auto')
             has_tools = bool(tools and tool_choice != 'none')
-            if has_tools:
-                tool_defs = []
-                for t in tools:
-                    func = t.get('function', {})
-                    tool_defs.append({
-                        'name': func.get('name', 'unknown'),
-                        'description': func.get('description', ''),
-                        'parameters': func.get('parameters', {})
-                    })
-                # 构建特定的 JSON 请求格式，让元宝理解并返回 JSON 格式的工具调用
-                tool_call_request = {
-                    'type': 'tool_call_request',
-                    'tools': tool_defs,
-                    'user_message': last_user_msg,
-                    'response_format': {
-                        'type': 'json_object',
-                        'schema': {
-                            'tool_calls': [
-                                {
-                                    'id': 'string, e.g. "call_abc123"',
-                                    'type': '"function"',
-                                    'function': {
-                                        'name': 'string, the tool name to call',
-                                        'arguments': {'param1': 'value1'}
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                }
-                tool_json_str = json.dumps(tool_call_request, ensure_ascii=False, indent=2)
-                user_msg = (
-                    f'【工具调用请求】\n'
-                    f'请根据用户问题从可用工具中选择一个，并严格按以下 JSON 格式回复（只返回 JSON，不要包含其他任何内容）：\n\n'
-                    f'可用工具定义：\n'
-                    f'{tool_json_str}\n\n'
-                    f'用户问题：{last_user_msg}\n\n'
-                    f'请仅返回 JSON 格式：{{"tool_calls": [{{"id": "call_xxx", "type": "function", "function": {{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}}}]}}'
-                )
 
             if not self.client.connected:
                 resp = self._http_response(503, 'Unavailable',
@@ -920,8 +851,26 @@ class YBDaemon:
                 writer.close()
                 return
 
-            # 发送到群聊并等待回复
+            # 先发送文件内容（不带 @），再 @元宝 发送 System/User 格式消息
             try:
+                if history_content:
+                    await self.client.send_group_message(GROUP_CODE, history_content)
+                    await asyncio.sleep(1)
+                if tools_content:
+                    await self.client.send_group_message(GROUP_CODE, tools_content)
+                    await asyncio.sleep(1)
+
+                # 发送后删除本地文件
+                for fpath in [history_file, tools_file]:
+                    try:
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
+                            logger.info(f"已删除本地文件: {fpath}")
+                    except Exception as e:
+                        logger.warning(f"删除文件失败 {fpath}: {e}")
+
+                # @元宝 发送 System/User 格式消息
+                user_msg = f"System:请读取以上两个文件的内容\nUser:{last_user_msg}"
                 reply = await self.send_and_wait(user_msg)
 
                 # ── 尝试解析工具调用 JSON 响应（只有请求中包含 tools 时才解析）──
@@ -1038,6 +987,17 @@ class YBDaemon:
 
     async def run(self):
         """启动守护进程"""
+        # 0. 启动时清理残余文件
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for fname in ['历史.txt', '工具.txt']:
+            fpath = os.path.join(base_dir, fname)
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+                    logger.info(f"启动时已清理残余文件: {fname}")
+            except Exception as e:
+                logger.warning(f"启动时清理文件失败 {fname}: {e}")
+
         # 1. 连接 WebSocket
         await self.client.connect()
         self._connected.set()
