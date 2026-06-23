@@ -53,6 +53,44 @@ YUANBAO_NICK = _cfg.get('YUANBAO_NICK', '元宝')
 DEBUG_MODE = _cfg.get('debug', False)
 SERVER_PORT = int(_cfg.get('PORT', 35500))
 API_KEY = _cfg.get('API_KEY', '')
+ADMIN_USERNAME = _cfg.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = _cfg.get('ADMIN_PASSWORD', 'admin123')
+
+
+def _reload_config():
+    """从 config.json 重新加载配置，更新模块级变量"""
+    global _cfg, APP_ID, APP_SECRET, GROUP_CODE, API_DOMAIN, WS_URL
+    global YUANBAO_USER_ID, YUANBAO_NICK, DEBUG_MODE, SERVER_PORT, API_KEY
+    global ADMIN_USERNAME, ADMIN_PASSWORD
+    with open(_config_path, 'r', encoding='utf-8') as f:
+        _cfg = json.load(f)
+    APP_ID = _cfg['APP_ID']
+    APP_SECRET = _cfg['APP_SECRET']
+    GROUP_CODE = _cfg['GROUP_CODE']
+    API_DOMAIN = _cfg.get('API_DOMAIN', 'bot.yuanbao.tencent.com')
+    WS_URL = _cfg.get('WS_URL', 'wss://bot-wss.yuanbao.tencent.com/wss/connection')
+    YUANBAO_USER_ID = _cfg.get('YUANBAO_USER_ID', 'szUvRH8s4ekettawNjDREmAG4W7h+Lhb8Sy9tq/otZU=')
+    YUANBAO_NICK = _cfg.get('YUANBAO_NICK', '元宝')
+    DEBUG_MODE = _cfg.get('debug', False)
+    SERVER_PORT = int(_cfg.get('PORT', 35500))
+    API_KEY = _cfg.get('API_KEY', '')
+    ADMIN_USERNAME = _cfg.get('ADMIN_USERNAME', 'admin')
+    ADMIN_PASSWORD = _cfg.get('ADMIN_PASSWORD', 'admin123')
+    logger.info("配置已重载")
+    return _cfg
+
+
+def _save_config(updates: dict) -> None:
+    """更新并保存 config.json，同时重载模块级变量"""
+    global _cfg
+    with open(_config_path, 'r', encoding='utf-8') as f:
+        _cfg = json.load(f)
+    _cfg.update(updates)
+    with open(_config_path, 'w', encoding='utf-8') as f:
+        json.dump(_cfg, f, ensure_ascii=False, indent=4)
+    _reload_config()
+    logger.info(f"配置已保存: {list(updates.keys())}")
+
 
 # ── 协议常量 ──
 CMD_TYPE_REQUEST = 0
@@ -740,6 +778,8 @@ class YBDaemon:
         self._connected = asyncio.Event()
         self._running = True
         self._http_server = None
+        # ── 管理员会话 ──
+        self._sessions: dict[str, float] = {}  # token -> created_time
 
         # 启动时清理旧文件
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -748,6 +788,286 @@ class YBDaemon:
             if os.path.exists(fpath):
                 os.remove(fpath)
                 logger.info(f"启动清理: 已删除旧文件 {fname}")
+
+    # ── 管理员会话管理 ──
+
+    def _generate_session(self) -> str:
+        token = uuid.uuid4().hex
+        self._sessions[token] = time.time()
+        return token
+
+    def _verify_session(self, cookies: dict) -> bool:
+        token = cookies.get('yb_admin_token', '')
+        if token in self._sessions:
+            created = self._sessions[token]
+            # 会话 24 小时有效
+            if time.time() - created < 86400:
+                return True
+            del self._sessions[token]
+        return False
+
+    @staticmethod
+    def _parse_cookies(header_str: str) -> dict:
+        result = {}
+        for part in header_str.split(';'):
+            part = part.strip()
+            if '=' in part:
+                k, v = part.split('=', 1)
+                result[k.strip()] = v.strip()
+        return result
+
+    @staticmethod
+    def _html_response(code: int, html: str, extra_headers: str = '') -> bytes:
+        body = html.encode('utf-8')
+        status = {200: 'OK', 302: 'Found', 401: 'Unauthorized', 404: 'Not Found'}
+        resp = (
+            f"HTTP/1.1 {code} {status.get(code, 'OK')}\r\n"
+            f"Content-Type: text/html; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            f"{extra_headers}"
+            f"\r\n"
+        ).encode('utf-8') + body
+        return resp
+
+    # ── 管理页面 HTML ──
+
+    @staticmethod
+    def _login_page_html(error: str = '') -> str:
+        err_block = ''
+        if error:
+            err_block = f'<div class="msg error">{error}</div>'
+        return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>管理员登录 - 元宝 Bot</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+.login-card{{background:#fff;border-radius:12px;padding:40px 36px;width:90%;max-width:400px;box-shadow:0 1px 3px rgba(0,0,0,.08),0 4px 12px rgba(0,0,0,.04)}}
+.login-card h2{{color:#1e293b;text-align:center;margin-bottom:4px;font-size:22px;font-weight:600}}
+.login-card .subtitle{{color:#94a3b8;text-align:center;font-size:13px;margin-bottom:28px}}
+.login-card label{{color:#475569;font-size:13px;display:block;margin-bottom:4px;font-weight:500}}
+.login-card input{{width:100%;padding:10px 14px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#1e293b;font-size:14px;outline:0;transition:.2s;margin-bottom:16px}}
+.login-card input:focus{{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12);background:#fff}}
+.login-card button{{width:100%;padding:10px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:15px;font-weight:500;cursor:pointer;transition:.2s}}
+.login-card button:hover{{background:#1d4ed8}}
+.msg{{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;text-align:center}}
+.msg.error{{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}}
+</style></head>
+<body>
+<div class="login-card">
+<h2>元宝 Bot 管理</h2>
+<p class="subtitle">请输入管理员账号密码登录</p>
+{err_block}
+<form method="post" action="/admin/login">
+<label for="u">用户名</label><input id="u" name="username" required autofocus placeholder="admin">
+<label for="p">密码</label><input id="p" name="password" type="password" required placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
+<button type="submit">登 录</button>
+</form>
+</div>
+</body></html>'''
+
+    @staticmethod
+    def _admin_panel_html(connected: bool) -> str:
+        status_class = 'connected' if connected else 'disconnected'
+        status_text = '已连接' if connected else '未连接'
+        return f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>管理面板 - 元宝 Bot</title>
+<style>
+:root{{--bg:#f0f2f5;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#94a3b8;--accent:#2563eb;--accent-hover:#1d4ed8;--green:#10b981;--red:#ef4444;--gray-bg:#f8fafc}}
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
+.nav{{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:56px;background:#fff;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}}
+.nav h1{{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px;color:#1e293b}}
+.nav .status{{font-size:11px;padding:2px 10px;border-radius:20px;font-weight:500;margin-left:6px}}
+.nav .status.connected{{background:#ecfdf5;color:var(--green)}}
+.nav .status.disconnected{{background:#fef2f2;color:var(--red)}}
+.nav a{{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 14px;border-radius:8px;transition:.15s}}
+.nav a:hover{{background:var(--bg);color:var(--text)}}
+.container{{max-width:960px;margin:0 auto;padding:24px 16px 80px}}
+.tabs{{display:flex;gap:0;margin-bottom:24px;border-bottom:1px solid var(--border)}}
+.tab{{padding:12px 20px;cursor:pointer;font-size:14px;font-weight:500;color:var(--muted);transition:.15s;border:0;background:0;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}}
+.tab.active{{color:var(--accent);border-bottom-color:var(--accent)}}
+.tab:hover:not(.active){{color:var(--text)}}
+.panel{{display:none}}
+.panel.active{{display:block}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:16px}}
+.card h3{{font-size:14px;font-weight:600;margin-bottom:16px;color:var(--text);letter-spacing:.3px}}
+.form-group{{margin-bottom:16px}}
+.form-group label{{display:block;font-size:12px;color:#64748b;margin-bottom:4px;font-weight:500}}
+.form-group input,.form-group textarea,.form-group select{{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--gray-bg);color:var(--text);font-size:14px;outline:0;transition:.15s;font-family:inherit}}
+.form-group input:focus,.form-group textarea:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.1);background:#fff}}
+.form-group textarea{{min-height:60px;resize:vertical}}
+.form-row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.btn{{padding:9px 20px;border:0;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:6px}}
+.btn-primary{{background:var(--accent);color:#fff}}
+.btn-primary:hover{{background:var(--accent-hover)}}
+.btn-danger{{background:#fef2f2;color:var(--red);border:1px solid #fecaca}}
+.btn-danger:hover{{background:#fee2e2}}
+.btn-sm{{padding:7px 14px;font-size:12px}}
+.toast{{position:fixed;top:20px;right:20px;padding:10px 18px;border-radius:8px;font-size:13px;z-index:999;transform:translateY(-20px);opacity:0;transition:.25s;pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.1)}}
+.toast.show{{transform:translateY(0);opacity:1}}
+.toast.success{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}}
+.toast.error{{background:#fef2f2;color:#991b1b;border:1px solid #fecaca}}
+.chat-box{{background:var(--gray-bg);border:1px solid var(--border);border-radius:8px;padding:12px;max-height:400px;overflow-y:auto;margin-bottom:12px;font-size:14px;line-height:1.6}}
+.chat-msg{{margin-bottom:8px;padding:8px 12px;border-radius:8px;max-width:85%}}
+.chat-msg.user{{background:#eff6ff;border:1px solid #bfdbfe;margin-left:auto;color:#1e40af}}
+.chat-msg.bot{{background:#fff;border:1px solid var(--border);margin-right:auto}}
+.chat-msg .meta{{font-size:11px;color:var(--muted);margin-bottom:2px;font-weight:500}}
+.chat-input-row{{display:flex;gap:8px}}
+.chat-input-row input{{flex:1;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--gray-bg);color:var(--text);font-size:14px;outline:0;transition:.15s}}
+.chat-input-row input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.1);background:#fff}}
+@media(max-width:640px){{.form-row{{grid-template-columns:1fr}}.container{{padding:16px 10px 80px}}.card{{padding:16px}}.nav h1{{font-size:15px}}}}
+.loading{{display:inline-block;width:14px;height:14px;border:2px solid #e2e8f0;border-top-color:var(--accent);border-radius:50%;animation:spin .6s infinite linear;vertical-align:middle}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+</style></head>
+<body>
+<div class="nav"><h1>元宝 Bot <span class="status {status_class}">{status_text}</span></h1><a href="/admin/logout">退出</a></div>
+<div class="container">
+<div class="tabs"><button class="tab active" data-tab="config">配置</button><button class="tab" data-tab="chat">聊天测试</button></div>
+
+<div id="panel-config" class="panel active">
+<div class="card"><h3>基本配置</h3>
+<div class="form-group"><label>APP_ID</label><input id="cfg-app_id" placeholder="必填"></div>
+<div class="form-group"><label>APP_SECRET</label><input id="cfg-app_secret" type="password" placeholder="必填"></div>
+<div class="form-group"><label>GROUP_CODE</label><input id="cfg-group_code" placeholder="目标群号"></div>
+<div class="form-row">
+<div class="form-group"><label>YUANBAO_USER_ID</label><input id="cfg-yb_uid" placeholder="元宝 AI 用户 ID"></div>
+<div class="form-group"><label>YUANBAO_NICK</label><input id="cfg-yb_nick" placeholder="元宝"></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label>PORT</label><input id="cfg-port" type="number" placeholder="35500"></div>
+<div class="form-group"><label>API_KEY (为空则不校验)</label><input id="cfg-api_key" placeholder="可选"></div>
+</div>
+<div class="form-row">
+<div class="form-group"><label>管理员用户名</label><input id="cfg-admin_user" placeholder="admin"></div>
+<div class="form-group"><label>管理员密码</label><input id="cfg-admin_pass" type="password" placeholder="留空不修改"></div>
+</div>
+<div class="form-group"><label>API_DOMAIN</label><input id="cfg-api_domain" placeholder="bot.yuanbao.tencent.com"></div>
+<div class="form-group" style="margin-bottom:0"><button class="btn btn-primary" onclick="saveConfig()">保存配置</button></div>
+</div>
+<div class="card"><h3>重启服务</h3><p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.5">修改配置后需要重启服务使配置生效，重启后连接会短暂断开。</p><button class="btn btn-danger" onclick="restartServer()">重启服务</button></div>
+</div>
+
+<div id="panel-chat" class="panel">
+<div class="card">
+<h3>聊天测试</h3>
+<div id="chat-messages" class="chat-box"><div style="text-align:center;color:var(--muted);padding:20px;font-size:13px">输入消息开始对话</div></div>
+<div class="chat-input-row">
+<input id="chat-input" placeholder="输入消息..." onkeydown="if(event.key==='Enter')sendChat()">
+<button class="btn btn-primary btn-sm" onclick="sendChat()">发送</button>
+</div>
+</div>
+</div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script>
+async function api(method, url, body) {{
+  const opt = {{method,headers:{{}},redirect:'error' }};
+  if (body) {{ opt.headers['Content-Type']='application/json'; opt.body=JSON.stringify(body); }}
+  try {{
+    const r = await fetch(url, opt);
+    if (r.status===401) {{ window.location.href='/admin'; return null; }}
+    const ct = r.headers.get('content-type')||'';
+    if (!ct.includes('application/json')) {{ window.location.href='/admin'; return null; }}
+    return await r.json();
+  }} catch(e) {{
+    window.location.href='/admin';
+    return null;
+  }}
+}}
+
+function toast(msg, type='success') {{
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast '+type+' show';
+  setTimeout(()=>t.classList.remove('show'), 3000);
+}}
+
+// 标签切换
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',function(){{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  this.classList.add('active');
+  document.getElementById('panel-'+this.dataset.tab).classList.add('active');
+}}));
+
+// 加载配置
+async function loadConfig() {{
+  const data = await api('GET','/admin/api/config');
+  if(!data) return;
+  document.getElementById('cfg-app_id').value = data.APP_ID||'';
+  document.getElementById('cfg-app_secret').value = data.APP_SECRET||'';
+  document.getElementById('cfg-group_code').value = data.GROUP_CODE||'';
+  document.getElementById('cfg-yb_uid').value = data.YUANBAO_USER_ID||'';
+  document.getElementById('cfg-yb_nick').value = data.YUANBAO_NICK||'元宝';
+  document.getElementById('cfg-port').value = data.PORT||35500;
+  document.getElementById('cfg-api_key').value = data.API_KEY||'';
+  document.getElementById('cfg-admin_user').value = data.ADMIN_USERNAME||'admin';
+  document.getElementById('cfg-api_domain').value = data.API_DOMAIN||'bot.yuanbao.tencent.com';
+}}
+loadConfig();
+
+// 保存配置
+async function saveConfig() {{
+  const body = {{
+    APP_ID: document.getElementById('cfg-app_id').value,
+    APP_SECRET: document.getElementById('cfg-app_secret').value,
+    GROUP_CODE: document.getElementById('cfg-group_code').value,
+    YUANBAO_USER_ID: document.getElementById('cfg-yb_uid').value,
+    YUANBAO_NICK: document.getElementById('cfg-yb_nick').value,
+    PORT: parseInt(document.getElementById('cfg-port').value)||35500,
+    API_KEY: document.getElementById('cfg-api_key').value,
+    ADMIN_USERNAME: document.getElementById('cfg-admin_user').value,
+    ADMIN_PASSWORD: document.getElementById('cfg-admin_pass').value,
+    API_DOMAIN: document.getElementById('cfg-api_domain').value,
+  }};
+  const res = await api('POST','/admin/api/config', body);
+  if(res&&res.status==='ok') toast('配置已保存','success');
+  else toast(res?.error||'保存失败','error');
+}}
+
+// 重启服务
+async function restartServer() {{if(!confirm('确认重启服务？连接会短暂断开。')) return;
+  const res = await api('POST','/admin/api/restart');
+  if(res&&res.status==='ok') toast('服务正在重启，请稍候...','success');
+  else toast(res?.error||'重启失败','error');
+}}
+
+// 聊天
+async function sendChat() {{
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if(!msg) return;
+  input.value = '';
+  const box = document.getElementById('chat-messages');
+  if(box.children.length===1&&box.children[0].style.textAlign==='center') box.innerHTML='';
+  box.insertAdjacentHTML('beforeend','<div class="chat-msg user"><div class="meta">你</div>'+escapeHtml(msg)+'</div>');
+  box.scrollTop = box.scrollHeight;
+  const loadingId = 'loading-' + Date.now();
+  box.insertAdjacentHTML('beforeend','<div class="chat-msg bot" id="'+loadingId+'"><div class="meta">元宝</div><span class="loading"></span> 思考中...</div>');
+  box.scrollTop = box.scrollHeight;
+  const res = await api('POST','/admin/api/chat', {{message:msg}});
+  const loadingEl = document.getElementById(loadingId);
+  if(loadingEl) loadingEl.remove();
+  if(res&&res.reply) {{
+    box.insertAdjacentHTML('beforeend','<div class="chat-msg bot"><div class="meta">元宝</div>'+escapeHtml(res.reply)+'</div>');
+  }} else {{
+    box.insertAdjacentHTML('beforeend','<div class="chat-msg bot"><div class="meta">元宝</div><span style="color:var(--red)">出错: '+(res?.error||'无响应')+'</span></div>');
+  }}
+  box.scrollTop = box.scrollHeight;
+}}
+
+function escapeHtml(s) {{
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}}
+</script>
+</body></html>'''
 
     async def _heartbeat_loop(self):
         while self._running and self.client.connected:
@@ -925,6 +1245,198 @@ class YBDaemon:
 
             logger.info(f"HTTP {req['method']} {req['path']} from {peer}")
 
+            # ── 解析 Cookie ──
+            cookie_str = req.get('headers', {}).get('cookie', '')
+            cookies = self._parse_cookies(cookie_str)
+
+            # ── 管理员路由（不需要 API Key） ──
+            path = req['path']
+            method = req['method']
+
+            # GET /admin - 登录页面
+            if path == '/admin' and method == 'GET':
+                if self._verify_session(cookies):
+                    writer.write(self._html_response(302, '', 'Location: /admin/panel\r\n'))
+                else:
+                    writer.write(self._html_response(200, self._login_page_html()))
+                await writer.drain()
+                writer.close()
+                return
+
+            # POST /admin/login - 登录
+            if path == '/admin/login' and method == 'POST':
+                # 解析 form-urlencoded 或 JSON
+                body_str = req['body'].decode('utf-8', errors='replace')
+                form_data = {}
+                if body_str.startswith('{'):
+                    try:
+                        form_data = json.loads(body_str)
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    for part in body_str.split('&'):
+                        if '=' in part:
+                            k, v = part.split('=', 1)
+                            from urllib.parse import unquote_plus
+                            form_data[unquote_plus(k)] = unquote_plus(v)
+                username = form_data.get('username', '')
+                password = form_data.get('password', '')
+                if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                    token = self._generate_session()
+                    writer.write(self._html_response(302, '',
+                        f'Set-Cookie: yb_admin_token={token}; Path=/; HttpOnly; SameSite=Lax\r\n'
+                        f'Location: /admin/panel\r\n'))
+                else:
+                    writer.write(self._html_response(200, self._login_page_html('用户名或密码错误')))
+                await writer.drain()
+                writer.close()
+                return
+
+            # GET /admin/logout - 退出
+            if path == '/admin/logout' and method == 'GET':
+                token = cookies.get('yb_admin_token', '')
+                if token in self._sessions:
+                    del self._sessions[token]
+                writer.write(self._html_response(302, '',
+                    'Set-Cookie: yb_admin_token=; Path=/; Max-Age=0\r\n'
+                    'Location: /admin\r\n'))
+                await writer.drain()
+                writer.close()
+                return
+
+            # 以下路由需要管理员会话
+            admin_paths = ['/admin/panel', '/admin/api/config', '/admin/api/chat', '/admin/api/restart']
+            is_admin = any(path.startswith(p) for p in ['/admin/'])
+            if is_admin:
+                if not self._verify_session(cookies):
+                    writer.write(self._html_response(302, '', 'Location: /admin\r\n'))
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # GET /admin/panel - 管理面板
+                if path == '/admin/panel' and method == 'GET':
+                    writer.write(self._html_response(200,
+                        self._admin_panel_html(self.client.connected)))
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # GET /admin/api/config - 获取配置
+                if path == '/admin/api/config' and method == 'GET':
+                    cfg = _reload_config()
+                    # 不返回密码原文（但允许管理员界面显示占位）
+                    cfg_copy = {k: v for k, v in cfg.items()}
+                    if 'ADMIN_PASSWORD' in cfg_copy:
+                        cfg_copy['ADMIN_PASSWORD'] = ''  # 不回传密码
+                    resp = self._http_response(200, 'OK', cfg_copy)
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # POST /admin/api/config - 保存配置
+                if path == '/admin/api/config' and method == 'POST':
+                    try:
+                        new_cfg = json.loads(req['body'].decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        resp = self._http_response(400, 'Bad Request',
+                                                   {'error': f'Invalid JSON: {e}'})
+                        writer.write(resp)
+                        await writer.drain()
+                        writer.close()
+                        return
+                    # 读取当前配置，合入新值
+                    current = _reload_config()
+                    allowed_keys = ['APP_ID', 'APP_SECRET', 'GROUP_CODE', 'YUANBAO_USER_ID',
+                                    'YUANBAO_NICK', 'PORT', 'API_KEY', 'API_DOMAIN',
+                                    'WS_URL', 'debug', 'ADMIN_USERNAME']
+                    for k in allowed_keys:
+                        if k in new_cfg:
+                            current[k] = new_cfg[k]
+                    # 密码特殊处理：只有非空才更新
+                    if new_cfg.get('ADMIN_PASSWORD', '').strip():
+                        current['ADMIN_PASSWORD'] = new_cfg['ADMIN_PASSWORD'].strip()
+                    # 写入 config.json
+                    try:
+                        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+                        with open(config_path, 'w', encoding='utf-8') as f:
+                            json.dump(current, f, ensure_ascii=False, indent=4)
+                        # 重新加载全局配置
+                        _reload_config()
+                        resp = self._http_response(200, 'OK', {'status': 'ok', 'message': '配置已保存'})
+                    except Exception as e:
+                        resp = self._http_response(500, 'Error',
+                                                   {'error': f'保存失败: {e}'})
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # POST /admin/api/chat - 聊天测试
+                if path == '/admin/api/chat' and method == 'POST':
+                    try:
+                        chat_req = json.loads(req['body'].decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        resp = self._http_response(400, 'Bad Request',
+                                                   {'error': f'Invalid JSON: {e}'})
+                        writer.write(resp)
+                        await writer.drain()
+                        writer.close()
+                        return
+                    if not self.client.connected:
+                        resp = self._http_response(503, 'Unavailable',
+                                                   {'error': 'Bot not connected'})
+                        writer.write(resp)
+                        await writer.drain()
+                        writer.close()
+                        return
+                    try:
+                        reply = await self.send_and_wait(chat_req.get('message', ''))
+                        resp = self._http_response(200, 'OK', {'reply': reply})
+                    except TimeoutError:
+                        resp = self._http_response(504, 'Gateway Timeout',
+                                                   {'error': '等待元宝回复超时'})
+                    except Exception as e:
+                        resp = self._http_response(500, 'Error', {'error': str(e)})
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # POST /admin/api/restart - 重启服务
+                if path == '/admin/api/restart' and method == 'POST':
+                    import subprocess
+                    try:
+                        script = os.path.abspath(__file__)
+                        pid = os.getpid()
+                        # 后台启动新进程
+                        subprocess.Popen([sys.executable, script])
+                        # 返回成功，然后退出当前进程
+                        resp = self._http_response(200, 'OK',
+                                                   {'status': 'ok', 'message': '服务正在重启'})
+                        writer.write(resp)
+                        await writer.drain()
+                        writer.close()
+                        # 关闭服务器
+                        self._running = False
+                        if self._http_server:
+                            self._http_server.close()
+                        os._exit(0)
+                    except Exception as e:
+                        resp = self._http_response(500, 'Error', {'error': str(e)})
+                        writer.write(resp)
+                        await writer.drain()
+                        writer.close()
+                        return
+
+                # 未知管理路径
+                resp = self._http_response(404, 'Not Found', {'error': 'Not Found'})
+                writer.write(resp)
+                await writer.drain()
+                writer.close()
+                return
+
             # ── API Key 鉴权 ──
             if API_KEY:
                 auth_header = req.get('headers', {}).get('authorization', '')
@@ -937,8 +1449,8 @@ class YBDaemon:
                     writer.close()
                     return
 
-            # ── 路由 ──
-            if req['path'] == '/v1/models' and req['method'] == 'GET':
+            # ── OpenAI 兼容路由 ──
+            if path == '/v1/models' and method == 'GET':
                 resp_body = {
                     'object': 'list',
                     'data': [
@@ -957,7 +1469,7 @@ class YBDaemon:
                 writer.close()
                 return
 
-            if req['path'] != '/v1/chat/completions' or req['method'] != 'POST':
+            if path != '/v1/chat/completions' or method != 'POST':
                 resp = self._http_response(404, 'Not Found', {'error': 'Not Found'})
                 writer.write(resp)
                 await writer.drain()
