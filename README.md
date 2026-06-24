@@ -16,6 +16,8 @@
 - **图片生成** — `POST /v1/images/generations`，通过 @元宝 生成图片，返回 COS 预签名直链
 - **智能前缀** — 根据最后一条消息的 `role` 自动决定 System 消息中的前缀：`role: tool` 时用 `Tool:`，否则用 `User:`
 - API Key 鉴权（可选）
+- **网站首页** — `GET /` 提供官网风格介绍页（独立 `index.html` 文件）
+- **Web 管理面板** — `GET /admin` 登录后可在网页端查看和管理配置，HTML 已抽离为独立文件 `admin.html`
 - 无文件日志，仅输出到控制台
 
 ## 使用

@@ -898,244 +898,35 @@ class YBDaemon:
         ).encode('utf-8') + body
         return resp
 
-    # ── 管理页面 HTML ──
+    # ── 管理页面 HTML（从文件读取） ──
 
     @staticmethod
-    def _login_page_html(error: str = '') -> str:
-        err_block = ''
-        if error:
-            err_block = f'<div class="msg error">{error}</div>'
-        return f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>管理员登录 - 元宝 Bot</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center}}
-.login-card{{background:#fff;border-radius:12px;padding:40px 36px;width:90%;max-width:400px;box-shadow:0 1px 3px rgba(0,0,0,.08),0 4px 12px rgba(0,0,0,.04)}}
-.login-card h2{{color:#1e293b;text-align:center;margin-bottom:4px;font-size:22px;font-weight:600}}
-.login-card .subtitle{{color:#94a3b8;text-align:center;font-size:13px;margin-bottom:28px}}
-.login-card label{{color:#475569;font-size:13px;display:block;margin-bottom:4px;font-weight:500}}
-.login-card input{{width:100%;padding:10px 14px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#1e293b;font-size:14px;outline:0;transition:.2s;margin-bottom:16px}}
-.login-card input:focus{{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12);background:#fff}}
-.login-card button{{width:100%;padding:10px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:15px;font-weight:500;cursor:pointer;transition:.2s}}
-.login-card button:hover{{background:#1d4ed8}}
-.msg{{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;text-align:center}}
-.msg.error{{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}}
-</style></head>
-<body>
-<div class="login-card">
-<h2>元宝 Bot 管理</h2>
-<p class="subtitle">请输入管理员账号密码登录</p>
-{err_block}
-<form method="post" action="/admin/login">
-<label for="u">用户名</label><input id="u" name="username" required autofocus placeholder="admin">
-<label for="p">密码</label><input id="p" name="password" type="password" required placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;">
-<button type="submit">登 录</button>
-</form>
-</div>
-</body></html>'''
+    def _read_template(name: str) -> str:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
 
     @staticmethod
-    def _admin_panel_html(connected: bool) -> str:
-        status_class = 'connected' if connected else 'disconnected'
-        status_text = '已连接' if connected else '未连接'
-        return f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>管理面板 - 元宝 Bot</title>
-<style>
-:root{{--bg:#f0f2f5;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#94a3b8;--accent:#2563eb;--accent-hover:#1d4ed8;--green:#10b981;--red:#ef4444;--gray-bg:#f8fafc}}
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
-.nav{{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:56px;background:#fff;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}}
-.nav h1{{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px;color:#1e293b}}
-.nav .status{{font-size:11px;padding:2px 10px;border-radius:20px;font-weight:500;margin-left:6px}}
-.nav .status.connected{{background:#ecfdf5;color:var(--green)}}
-.nav .status.disconnected{{background:#fef2f2;color:var(--red)}}
-.nav a{{color:var(--muted);text-decoration:none;font-size:13px;padding:6px 14px;border-radius:8px;transition:.15s}}
-.nav a:hover{{background:var(--bg);color:var(--text)}}
-.container{{max-width:960px;margin:0 auto;padding:24px 16px 80px}}
-.tabs{{display:flex;gap:0;margin-bottom:24px;border-bottom:1px solid var(--border)}}
-.tab{{padding:12px 20px;cursor:pointer;font-size:14px;font-weight:500;color:var(--muted);transition:.15s;border:0;background:0;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}}
-.tab.active{{color:var(--accent);border-bottom-color:var(--accent)}}
-.tab:hover:not(.active){{color:var(--text)}}
-.panel{{display:none}}
-.panel.active{{display:block}}
-.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:24px;margin-bottom:16px}}
-.card h3{{font-size:14px;font-weight:600;margin-bottom:16px;color:var(--text);letter-spacing:.3px}}
-.form-group{{margin-bottom:16px}}
-.form-group label{{display:block;font-size:12px;color:#64748b;margin-bottom:4px;font-weight:500}}
-.form-group input,.form-group textarea,.form-group select{{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--gray-bg);color:var(--text);font-size:14px;outline:0;transition:.15s;font-family:inherit}}
-.form-group input:focus,.form-group textarea:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.1);background:#fff}}
-.form-group textarea{{min-height:60px;resize:vertical}}
-.form-row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
-.btn{{padding:9px 20px;border:0;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:6px}}
-.btn-primary{{background:var(--accent);color:#fff}}
-.btn-primary:hover{{background:var(--accent-hover)}}
-.btn-danger{{background:#fef2f2;color:var(--red);border:1px solid #fecaca}}
-.btn-danger:hover{{background:#fee2e2}}
-.btn-sm{{padding:7px 14px;font-size:12px}}
-.toast{{position:fixed;top:20px;right:20px;padding:10px 18px;border-radius:8px;font-size:13px;z-index:999;transform:translateY(-20px);opacity:0;transition:.25s;pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.1)}}
-.toast.show{{transform:translateY(0);opacity:1}}
-.toast.success{{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}}
-.toast.error{{background:#fef2f2;color:#991b1b;border:1px solid #fecaca}}
-.chat-box{{background:var(--gray-bg);border:1px solid var(--border);border-radius:8px;padding:12px;max-height:400px;overflow-y:auto;margin-bottom:12px;font-size:14px;line-height:1.6}}
-.chat-msg{{margin-bottom:8px;padding:8px 12px;border-radius:8px;max-width:85%}}
-.chat-msg.user{{background:#eff6ff;border:1px solid #bfdbfe;margin-left:auto;color:#1e40af}}
-.chat-msg.bot{{background:#fff;border:1px solid var(--border);margin-right:auto}}
-.chat-msg .meta{{font-size:11px;color:var(--muted);margin-bottom:2px;font-weight:500}}
-.chat-input-row{{display:flex;gap:8px}}
-.chat-input-row input{{flex:1;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--gray-bg);color:var(--text);font-size:14px;outline:0;transition:.15s}}
-.chat-input-row input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.1);background:#fff}}
-@media(max-width:640px){{.form-row{{grid-template-columns:1fr}}.container{{padding:16px 10px 80px}}.card{{padding:16px}}.nav h1{{font-size:15px}}}}
-.loading{{display:inline-block;width:14px;height:14px;border:2px solid #e2e8f0;border-top-color:var(--accent);border-radius:50%;animation:spin .6s infinite linear;vertical-align:middle}}
-@keyframes spin{{to{{transform:rotate(360deg)}}}}
-</style></head>
-<body>
-<div class="nav"><h1>元宝 Bot <span class="status {status_class}">{status_text}</span></h1><a href="/admin/logout">退出</a></div>
-<div class="container">
-<div class="tabs"><button class="tab active" data-tab="config">配置</button><button class="tab" data-tab="chat">聊天测试</button></div>
-
-<div id="panel-config" class="panel active">
-<div class="card"><h3>基本配置</h3>
-<div class="form-group"><label>APP_ID</label><input id="cfg-app_id" placeholder="必填"></div>
-<div class="form-group"><label>APP_SECRET</label><input id="cfg-app_secret" type="password" placeholder="必填"></div>
-<div class="form-group"><label>GROUP_CODE</label><input id="cfg-group_code" placeholder="目标群号"></div>
-<div class="form-row">
-<div class="form-group"><label>YUANBAO_USER_ID</label><input id="cfg-yb_uid" placeholder="元宝 AI 用户 ID"></div>
-<div class="form-group"><label>YUANBAO_NICK</label><input id="cfg-yb_nick" placeholder="元宝"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>PORT</label><input id="cfg-port" type="number" placeholder="35500"></div>
-<div class="form-group"><label>API_KEY (为空则不校验)</label><input id="cfg-api_key" placeholder="可选"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label>管理员用户名</label><input id="cfg-admin_user" placeholder="admin"></div>
-<div class="form-group"><label>管理员密码</label><input id="cfg-admin_pass" type="password" placeholder="留空不修改"></div>
-</div>
-<div class="form-group"><label>API_DOMAIN</label><input id="cfg-api_domain" placeholder="bot.yuanbao.tencent.com"></div>
-<div class="form-group" style="margin-bottom:0"><button class="btn btn-primary" onclick="saveConfig()">保存配置</button></div>
-</div>
-<div class="card"><h3>重启服务</h3><p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.5">修改配置后需要重启服务使配置生效，重启后连接会短暂断开。</p><button class="btn btn-danger" onclick="restartServer()">重启服务</button></div>
-</div>
-
-<div id="panel-chat" class="panel">
-<div class="card">
-<h3>聊天测试</h3>
-<div id="chat-messages" class="chat-box"><div style="text-align:center;color:var(--muted);padding:20px;font-size:13px">输入消息开始对话</div></div>
-<div class="chat-input-row">
-<input id="chat-input" placeholder="输入消息..." onkeydown="if(event.key==='Enter')sendChat()">
-<button class="btn btn-primary btn-sm" onclick="sendChat()">发送</button>
-</div>
-</div>
-</div>
-</div>
-
-<div id="toast" class="toast"></div>
-<script>
-async function api(method, url, body) {{
-  const opt = {{method,headers:{{}},redirect:'error' }};
-  if (body) {{ opt.headers['Content-Type']='application/json'; opt.body=JSON.stringify(body); }}
-  try {{
-    const r = await fetch(url, opt);
-    if (r.status===401) {{ window.location.href='/admin'; return null; }}
-    const ct = r.headers.get('content-type')||'';
-    if (!ct.includes('application/json')) {{ window.location.href='/admin'; return null; }}
-    return await r.json();
-  }} catch(e) {{
-    window.location.href='/admin';
-    return null;
-  }}
-}}
-
-function toast(msg, type='success') {{
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.className = 'toast '+type+' show';
-  setTimeout(()=>t.classList.remove('show'), 3000);
-}}
-
-// 标签切换
-document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',function(){{
-  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
-  this.classList.add('active');
-  document.getElementById('panel-'+this.dataset.tab).classList.add('active');
-}}));
-
-// 加载配置
-async function loadConfig() {{
-  const data = await api('GET','/admin/api/config');
-  if(!data) return;
-  document.getElementById('cfg-app_id').value = data.APP_ID||'';
-  document.getElementById('cfg-app_secret').value = data.APP_SECRET||'';
-  document.getElementById('cfg-group_code').value = data.GROUP_CODE||'';
-  document.getElementById('cfg-yb_uid').value = data.YUANBAO_USER_ID||'';
-  document.getElementById('cfg-yb_nick').value = data.YUANBAO_NICK||'元宝';
-  document.getElementById('cfg-port').value = data.PORT||35500;
-  document.getElementById('cfg-api_key').value = data.API_KEY||'';
-  document.getElementById('cfg-admin_user').value = data.ADMIN_USERNAME||'admin';
-  document.getElementById('cfg-api_domain').value = data.API_DOMAIN||'bot.yuanbao.tencent.com';
-}}
-loadConfig();
-
-// 保存配置
-async function saveConfig() {{
-  const body = {{
-    APP_ID: document.getElementById('cfg-app_id').value,
-    APP_SECRET: document.getElementById('cfg-app_secret').value,
-    GROUP_CODE: document.getElementById('cfg-group_code').value,
-    YUANBAO_USER_ID: document.getElementById('cfg-yb_uid').value,
-    YUANBAO_NICK: document.getElementById('cfg-yb_nick').value,
-    PORT: parseInt(document.getElementById('cfg-port').value)||35500,
-    API_KEY: document.getElementById('cfg-api_key').value,
-    ADMIN_USERNAME: document.getElementById('cfg-admin_user').value,
-    ADMIN_PASSWORD: document.getElementById('cfg-admin_pass').value,
-    API_DOMAIN: document.getElementById('cfg-api_domain').value,
-  }};
-  const res = await api('POST','/admin/api/config', body);
-  if(res&&res.status==='ok') toast('配置已保存','success');
-  else toast(res?.error||'保存失败','error');
-}}
-
-// 重启服务
-async function restartServer() {{if(!confirm('确认重启服务？连接会短暂断开。')) return;
-  const res = await api('POST','/admin/api/restart');
-  if(res&&res.status==='ok') toast('服务正在重启，请稍候...','success');
-  else toast(res?.error||'重启失败','error');
-}}
-
-// 聊天
-async function sendChat() {{
-  const input = document.getElementById('chat-input');
-  const msg = input.value.trim();
-  if(!msg) return;
-  input.value = '';
-  const box = document.getElementById('chat-messages');
-  if(box.children.length===1&&box.children[0].style.textAlign==='center') box.innerHTML='';
-  box.insertAdjacentHTML('beforeend','<div class="chat-msg user"><div class="meta">你</div>'+escapeHtml(msg)+'</div>');
-  box.scrollTop = box.scrollHeight;
-  const loadingId = 'loading-' + Date.now();
-  box.insertAdjacentHTML('beforeend','<div class="chat-msg bot" id="'+loadingId+'"><div class="meta">元宝</div><span class="loading"></span> 思考中...</div>');
-  box.scrollTop = box.scrollHeight;
-  const res = await api('POST','/admin/api/chat', {{message:msg}});
-  const loadingEl = document.getElementById(loadingId);
-  if(loadingEl) loadingEl.remove();
-  if(res&&res.reply) {{
-    box.insertAdjacentHTML('beforeend','<div class="chat-msg bot"><div class="meta">元宝</div>'+escapeHtml(res.reply)+'</div>');
-  }} else {{
-    box.insertAdjacentHTML('beforeend','<div class="chat-msg bot"><div class="meta">元宝</div><span style="color:var(--red)">出错: '+(res?.error||'无响应')+'</span></div>');
-  }}
-  box.scrollTop = box.scrollHeight;
-}}
-
-function escapeHtml(s) {{
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}}
-</script>
-</body></html>'''
+    def _render_admin_page(page_type: str, connected: bool = False, error: str = '') -> str:
+        html = YBDaemon._read_template('admin.html')
+        if page_type == 'login':
+            html = html.replace('{LOGIN_DISPLAY}', 'block')
+            html = html.replace('{ADMIN_DISPLAY}', 'none')
+            html = html.replace('{TITLE}', '管理员登录 - 元宝 Bot')
+            err_block = f'<div class="msg error">{error}</div>' if error else ''
+            html = html.replace('{LOGIN_ERROR_BLOCK}', err_block)
+            html = html.replace('{STATUS_CLASS}', '')
+            html = html.replace('{STATUS_TEXT}', '')
+        else:
+            html = html.replace('{LOGIN_DISPLAY}', 'none')
+            html = html.replace('{ADMIN_DISPLAY}', 'block')
+            html = html.replace('{TITLE}', '管理面板 - 元宝 Bot')
+            html = html.replace('{LOGIN_ERROR_BLOCK}', '')
+            status_class = 'connected' if connected else 'disconnected'
+            status_text = '已连接' if connected else '未连接'
+            html = html.replace('{STATUS_CLASS}', status_class)
+            html = html.replace('{STATUS_TEXT}', status_text)
+        return html
 
     async def _heartbeat_loop(self):
         while self._running and self.client.connected:
@@ -1387,12 +1178,20 @@ function escapeHtml(s) {{
             path = req['path']
             method = req['method']
 
+            # GET / - 首页
+            if path == '/' and method == 'GET':
+                html = self._read_template('index.html')
+                writer.write(self._html_response(200, html))
+                await writer.drain()
+                writer.close()
+                return
+
             # GET /admin - 登录页面
             if path == '/admin' and method == 'GET':
                 if self._verify_session(cookies):
                     writer.write(self._html_response(302, '', 'Location: /admin/panel\r\n'))
                 else:
-                    writer.write(self._html_response(200, self._login_page_html()))
+                    writer.write(self._html_response(200, self._render_admin_page('login')))
                 await writer.drain()
                 writer.close()
                 return
@@ -1421,7 +1220,7 @@ function escapeHtml(s) {{
                         f'Set-Cookie: yb_admin_token={token}; Path=/; HttpOnly; SameSite=Lax\r\n'
                         f'Location: /admin/panel\r\n'))
                 else:
-                    writer.write(self._html_response(200, self._login_page_html('用户名或密码错误')))
+                    writer.write(self._html_response(200, self._render_admin_page('login', error='用户名或密码错误')))
                 await writer.drain()
                 writer.close()
                 return
@@ -1451,7 +1250,7 @@ function escapeHtml(s) {{
                 # GET /admin/panel - 管理面板
                 if path == '/admin/panel' and method == 'GET':
                     writer.write(self._html_response(200,
-                        self._admin_panel_html(self.client.connected)))
+                        self._render_admin_page('panel', connected=self.client.connected)))
                     await writer.drain()
                     writer.close()
                     return
