@@ -26,6 +26,7 @@ import time
 import uuid
 import logging
 import random
+import re
 import hmac
 import hashlib
 import string
@@ -336,17 +337,28 @@ class SimpleProtobufCodec:
             result['groupCode'] = result['group_code']
             result['msg_id'] = raw.get('msg_id', raw.get('msgId', ''))
             result['msgId'] = result['msg_id']
-            # 从 msg_body 数组中提取 TIMTextElem 的文本
+            # 从 msg_body 数组中提取文本和图片 URL
             msg_body = raw.get('msg_body', [])
             text = ''
+            image_urls = []
             for elem in msg_body:
-                if isinstance(elem, dict) and elem.get('msg_type') == 'TIMTextElem':
-                    mcontent = elem.get('msg_content', {})
-                    if isinstance(mcontent, dict):
-                        text = mcontent.get('text', '') or ''
-                        if text:
-                            break
+                if not isinstance(elem, dict):
+                    continue
+                msg_type = elem.get('msg_type', '')
+                mcontent = elem.get('msg_content', {})
+                if not isinstance(mcontent, dict):
+                    continue
+                if msg_type == 'TIMTextElem':
+                    t = mcontent.get('text', '') or ''
+                    if t:
+                        text = t
+                elif msg_type == 'TIMImageElem':
+                    img_array = mcontent.get('image_info_array', [])
+                    for img_info in img_array:
+                        if isinstance(img_info, dict) and img_info.get('url'):
+                            image_urls.append(img_info['url'])
             result['text'] = text
+            result['image_urls'] = image_urls
             return result
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
@@ -386,6 +398,8 @@ class SimpleProtobufCodec:
                     pos += length
                 else:
                     break
+        result.setdefault('text', '')
+        result['image_urls'] = []
         return result
 
     @staticmethod
@@ -778,6 +792,9 @@ class YBDaemon:
         self._connected = asyncio.Event()
         self._running = True
         self._http_server = None
+        # 用于缓冲元宝的连续推送（文字+图片），使用 debounce 合并后 resolve
+        self._reply_buffer: list[dict] = []
+        self._reply_timer: asyncio.Task | None = None
         # ── 管理员会话 ──
         self._sessions: dict[str, float] = {}  # token -> created_time
 
@@ -1116,7 +1133,8 @@ function escapeHtml(s) {{
 
                     if DEBUG_MODE:
                         logger.info(f"🔍 [DEBUG] 解码结果: from={from_account} group={group_code} "
-                                    f"text='{text[:80]}' msgBody_keys={[k for k in inbound.keys() if 'msg' in k.lower() or 'body' in k.lower()]}")
+                                    f"text='{text[:80]}' images={len(inbound.get('image_urls', []))} "
+                                    f"msgBody_keys={[k for k in inbound.keys() if 'msg' in k.lower() or 'body' in k.lower()]}")
                     logger.debug(f"收到消息 from={from_account} group={group_code} text={text[:40]}")
 
                     # 关键：检测是否是目标群中元宝的回复
@@ -1124,10 +1142,24 @@ function escapeHtml(s) {{
                             and from_account == YUANBAO_USER_ID
                             and self._pending_future is not None
                             and not self._pending_future.done()):
-                        logger.info(f"收到元宝回复: {text}")
-                        fut = self._pending_future
-                        self._pending_future = None
-                        fut.set_result(text)
+                        image_urls = inbound.get('image_urls', [])
+                        self._reply_buffer.append({
+                            'text': text,
+                            'image_urls': image_urls,
+                        })
+                        log_parts = []
+                        if text:
+                            log_parts.append(f"text='{text[:60]}'")
+                        if image_urls:
+                            log_parts.append(f"images={len(image_urls)}张")
+                        logger.info(f"收到元宝回复: {', '.join(log_parts)}")
+
+                        # 取消旧 timer，重新设置 debounce
+                        if self._reply_timer:
+                            self._reply_timer.cancel()
+                        self._reply_timer = asyncio.create_task(
+                            self._flush_reply_debounce()
+                        )
 
                 except Exception as e:
                     logger.error(f"消息处理异常: {e}")
@@ -1142,10 +1174,57 @@ function escapeHtml(s) {{
             if self._pending_future and not self._pending_future.done():
                 self._pending_future.set_exception(Exception("连接断开"))
 
+    async def _flush_reply_debounce(self):
+        """等待一小段时间后合并缓冲区的所有回复（文字+图片），然后 resolve future"""
+        try:
+            await asyncio.sleep(0.3)  # 300ms debounce，等待连续推送
+        except asyncio.CancelledError:
+            return  # 新的推送来了，取消当前 timer
+
+        # 合并缓冲区
+        combined_text = ''
+        combined_images = []
+        for part in self._reply_buffer:
+            if part['text']:
+                if combined_text:
+                    combined_text += '\n'
+                combined_text += part['text']
+            combined_images.extend(part['image_urls'])
+
+        # 去重图片 URL
+        seen = set()
+        unique_images = []
+        for url in combined_images:
+            if url not in seen:
+                seen.add(url)
+                unique_images.append(url)
+
+        # 构造最终回复
+        final_reply = combined_text
+        for url in unique_images:
+            if final_reply:
+                final_reply += '\n\n'
+            final_reply += f'![image]({url})'
+
+        self._reply_buffer = []
+        self._reply_timer = None
+
+        fut = self._pending_future
+        self._pending_future = None
+        if fut and not fut.done():
+            logger.info(f"合并回复完成: text_len={len(combined_text)}, images={len(unique_images)}")
+            fut.set_result(final_reply)
+
     async def send_and_wait(self, user_msg: str) -> str:
         """发送消息到群 @元宝，等待回复"""
         if self._pending_future is not None:
             raise Exception("已有待处理的请求")
+
+        # 清理任何残留的 timer 和 buffer（理论上不应有，但防御性清理）
+        if self._reply_timer:
+            self._reply_timer.cancel()
+            self._reply_timer = None
+        self._reply_buffer = []
 
         future = asyncio.get_running_loop().create_future()
         self._pending_future = future
@@ -1161,6 +1240,10 @@ function escapeHtml(s) {{
             return reply
         except asyncio.TimeoutError:
             self._pending_future = None
+            self._reply_buffer = []
+            if self._reply_timer:
+                self._reply_timer.cancel()
+                self._reply_timer = None
             raise TimeoutError("等待元宝回复超时")
 
     # ── HTTP 服务器 ──
@@ -1462,6 +1545,81 @@ function escapeHtml(s) {{
                             'permission': []
                         }
                     ]
+                }
+                resp = self._http_response(200, 'OK', resp_body)
+                writer.write(resp)
+                await writer.drain()
+                writer.close()
+                return
+
+            # ── OpenAI 图片生成 ──
+            if path == '/v1/images/generations' and method == 'POST':
+                try:
+                    req_body = json.loads(req['body'].decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    resp = self._http_response(400, 'Bad Request', {
+                        'error': f'Invalid JSON: {e}',
+                        'message': '请求体必须是有效的 JSON'
+                    })
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                prompt = req_body.get('prompt', '').strip()
+                if not prompt:
+                    resp = self._http_response(400, 'Bad Request', {
+                        'error': 'prompt is required',
+                        'message': '请提供 prompt 字段（描述要生成的图片）'
+                    })
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # 解析图片比例（OpenAI 标准 size 参数，如 "1024x1024"）
+                size_str = req_body.get('size', '').strip()
+                if not size_str:
+                    width, height = 512, 512
+                else:
+                    parts = re.split(r'[x×*]', size_str.lower())
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        width, height = int(parts[0]), int(parts[1])
+                    else:
+                        width, height = 512, 512
+
+                # 直接 @元宝，不发文件
+                user_msg = f"System:请生成一张图片，不要发多余文字说明，直接发送图片，图片比例 {width}x{height}\n{prompt}"
+                logger.info(f"图片生成请求: prompt='{prompt[:80]}' size={width}x{height}")
+                try:
+                    reply = await self.send_and_wait(user_msg)
+                except TimeoutError:
+                    resp = self._http_response(504, 'Gateway Timeout', {
+                        'error': '等待元宝回复超时'
+                    })
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # 从回复中提取图片 URL（格式：![image](url)）
+                image_urls = re.findall(r'!\[image\]\(([^)]+)\)', reply)
+
+                if not image_urls:
+                    resp = self._http_response(500, 'Error', {
+                        'error': '元宝未生成图片',
+                        'message': reply[:300] if reply else '无回复'
+                    })
+                    writer.write(resp)
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # 构造 OpenAI 兼容响应
+                data_entries = [{'url': url} for url in image_urls]
+                resp_body = {
+                    'created': int(time.time()),
+                    'data': data_entries
                 }
                 resp = self._http_response(200, 'OK', resp_body)
                 writer.write(resp)
