@@ -45,6 +45,7 @@ with open(_config_path, 'r', encoding='utf-8') as f:
 
 APP_ID = _cfg['APP_ID']
 APP_SECRET = _cfg['APP_SECRET']
+BOT_ID = _cfg.get('BOT_ID', '')
 GROUP_CODE = _cfg['GROUP_CODE']
 API_DOMAIN = _cfg.get('API_DOMAIN', 'bot.yuanbao.tencent.com')
 WS_URL = _cfg.get('WS_URL', 'wss://bot-wss.yuanbao.tencent.com/wss/connection')
@@ -60,13 +61,14 @@ ADMIN_PASSWORD = _cfg.get('ADMIN_PASSWORD', 'admin123')
 
 def _reload_config():
     """从 config.json 重新加载配置，更新模块级变量"""
-    global _cfg, APP_ID, APP_SECRET, GROUP_CODE, API_DOMAIN, WS_URL
+    global _cfg, APP_ID, APP_SECRET, BOT_ID, GROUP_CODE, API_DOMAIN, WS_URL
     global YUANBAO_USER_ID, YUANBAO_NICK, DEBUG_MODE, SERVER_PORT, API_KEY
     global ADMIN_USERNAME, ADMIN_PASSWORD
     with open(_config_path, 'r', encoding='utf-8') as f:
         _cfg = json.load(f)
     APP_ID = _cfg['APP_ID']
     APP_SECRET = _cfg['APP_SECRET']
+    BOT_ID = _cfg.get('BOT_ID', '')
     GROUP_CODE = _cfg['GROUP_CODE']
     API_DOMAIN = _cfg.get('API_DOMAIN', 'bot.yuanbao.tencent.com')
     WS_URL = _cfg.get('WS_URL', 'wss://bot-wss.yuanbao.tencent.com/wss/connection')
@@ -627,6 +629,55 @@ class YuanbaoClient:
                 return None
         except Exception as e:
             logger.warning(f"获取上传凭证错误: {e}")
+            return None
+
+    def resolve_image_url(self, resource_url: str) -> str | None:
+        """将元宝图片资源保护 URL（/api/resource/download?resourceId=xxx）转换为 COS 预签名直链
+
+        流程：
+        1. 从 URL 中提取 resourceId
+        2. 调用 /api/resource/v1/download 接口（带上 X-ID + X-Token 鉴权头）
+        3. 返回 COS 预签名直链（可直接 curl/wget 下载）
+        """
+        import requests as _requests
+
+        # 从 URL 中提取 resourceId
+        match = re.search(r'resourceId=([^&]+)', resource_url)
+        if not match:
+            logger.warning(f"无法从 URL 中提取 resourceId: {resource_url}")
+            return None
+
+        resource_id = match.group(1)
+        url = f"https://{API_DOMAIN}/api/resource/v1/download?resourceId={resource_id}"
+        headers = {
+            "X-ID": BOT_ID or self.bot_id or "",
+            "X-Token": self.token or "",
+            "X-Source": "web",
+            "X-AppVersion": "1.0.11",
+            "X-OperationSystem": "linux",
+            "X-Instance-Id": self.instance_id,
+            "X-Bot-Version": "2026.3.22",
+        }
+
+        try:
+            resp = _requests.get(url, headers=headers, timeout=30)
+            result = resp.json()
+            # API 直接返回 COS 预签名直链在顶层（如 {"realUrl": "https://..."}）
+            cos_url = result.get("realUrl") or result.get("url") or ""
+            if cos_url and cos_url.startswith("http"):
+                logger.info(f"图片直链获取成功: {cos_url[:80]}...")
+                return cos_url
+            # 也可能包装在 code/data 结构中
+            if result.get("code", 0) == 0:
+                data = result.get("data", {})
+                cos_url = data.get("url") or data.get("realUrl") or ""
+                if cos_url:
+                    logger.info(f"图片直链获取成功: {cos_url[:80]}...")
+                    return cos_url
+            logger.warning(f"获取图片直链失败: {result}")
+            return None
+        except Exception as e:
+            logger.warning(f"获取图片直链错误: {e}")
             return None
 
     def _upload_to_cos(self, config: dict, data: bytes, filename: str) -> str | None:
@@ -1603,9 +1654,9 @@ function escapeHtml(s) {{
                     return
 
                 # 从回复中提取图片 URL（格式：![image](url)）
-                image_urls = re.findall(r'!\[image\]\(([^)]+)\)', reply)
+                raw_urls = re.findall(r'!\[image\]\(([^)]+)\)', reply)
 
-                if not image_urls:
+                if not raw_urls:
                     resp = self._http_response(500, 'Error', {
                         'error': '元宝未生成图片',
                         'message': reply[:300] if reply else '无回复'
@@ -1615,8 +1666,26 @@ function escapeHtml(s) {{
                     writer.close()
                     return
 
+                # 将保护资源 URL 解析为 COS 预签名直链
+                resolved_urls = []
+                for url in raw_urls:
+                    if 'resourceId=' in url:
+                        resolved = self.client.resolve_image_url(url)
+                        if resolved:
+                            resolved_urls.append(resolved)
+                        else:
+                            # 解析失败时保留原始 URL
+                            resolved_urls.append(url)
+                    else:
+                        resolved_urls.append(url)
+
+                if resolved_urls:
+                    logger.info(f"图片直链解析完成: {len(resolved_urls)}/{len(raw_urls)} 张成功")
+                else:
+                    logger.warning("所有图片 URL 解析失败，返回原始 URL")
+
                 # 构造 OpenAI 兼容响应
-                data_entries = [{'url': url} for url in image_urls]
+                data_entries = [{'url': url} for url in resolved_urls]
                 resp_body = {
                     'created': int(time.time()),
                     'data': data_entries
