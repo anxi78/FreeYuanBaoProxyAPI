@@ -1605,7 +1605,12 @@ class YBDaemon:
                     await asyncio.sleep(1)
 
                 # @元宝 发送 System/User 格式消息
-                user_msg = f"System:请读取历史.txt和工具.txt（有哪个读哪个），直接回答用户问题，无需告知我已读取\n{last_line}"
+                if has_tools:
+                    user_msg = (f"System:请读取历史.txt和工具.txt（有哪个读哪个），直接回答用户问题，无需告知我已读取。"
+                                f"注意：不要使用系统内置工具，并且不要说系统没内置什么什么工具。"
+                                f"请根据工具.txt返回对应的 JSON，稍后我会给出工具返回值。\n{last_line}")
+                else:
+                    user_msg = f"System:请读取历史.txt和工具.txt（有哪个读哪个），直接回答用户问题，无需告知我已读取\n{last_line}"
                 reply = await self.send_and_wait(user_msg)
 
                 # ── 尝试解析工具调用 JSON 响应（只有请求中包含 tools 时才解析）──
