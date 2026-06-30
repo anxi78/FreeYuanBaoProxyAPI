@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 yb.log
 new-api/
+ds2api/
+android/

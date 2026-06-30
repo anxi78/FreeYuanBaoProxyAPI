@@ -1134,6 +1134,98 @@ class YBDaemon:
         ).encode('utf-8') + body_bytes
         return resp
 
+    @staticmethod
+    def _sse_headers() -> bytes:
+        """构造 SSE (Server-Sent Events) 响应头"""
+        return (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+        ).encode('utf-8')
+
+    @staticmethod
+    async def _write_sse(writer, data: dict):
+        """写入单个 SSE 事件 data: <json>"""
+        writer.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
+        await writer.drain()
+
+    async def _handle_sse_response(
+        self,
+        writer: asyncio.StreamWriter,
+        reply: str,
+        tool_calls: list | None,
+        user_msg: str
+    ):
+        """处理 SSE 流式响应"""
+        created = int(time.time())
+        req_id = f'chatcmpl-{uuid.uuid4().hex}'
+        model = 'yuanbao'
+        shared = {
+            'id': req_id,
+            'object': 'chat.completion.chunk',
+            'created': created,
+            'model': model
+        }
+
+        # 写 SSE 头部
+        writer.write(self._sse_headers())
+        await writer.drain()
+
+        if tool_calls:
+            # 第一个 chunk：role
+            await self._write_sse(writer, {
+                **shared,
+                'choices': [{'index': 0, 'delta': {'role': 'assistant'}}]
+            })
+            # 第二个 chunk：tool_calls
+            await self._write_sse(writer, {
+                **shared,
+                'choices': [{'index': 0, 'delta': {'tool_calls': tool_calls}}]
+            })
+            # 最终 chunk：finish_reason + usage
+            await self._write_sse(writer, {
+                **shared,
+                'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}],
+                'usage': {
+                    'prompt_tokens': len(user_msg),
+                    'completion_tokens': len(reply),
+                    'total_tokens': len(user_msg) + len(reply)
+                }
+            })
+        else:
+            # 第一个 chunk：role
+            await self._write_sse(writer, {
+                **shared,
+                'choices': [{'index': 0, 'delta': {'role': 'assistant'}}]
+            })
+            # 按句子切分（支持中英文标点 + 换行符），模拟流式输出
+            sentences = re.split(r'(?<=[。！？.!?\n])', reply)
+            for sent in sentences:
+                if not sent.strip():
+                    continue
+                await self._write_sse(writer, {
+                    **shared,
+                    'choices': [{'index': 0, 'delta': {'content': sent}}]
+                })
+                await asyncio.sleep(0.02)
+            # 最终 chunk：finish_reason + usage
+            await self._write_sse(writer, {
+                **shared,
+                'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
+                'usage': {
+                    'prompt_tokens': len(user_msg),
+                    'completion_tokens': len(reply),
+                    'total_tokens': len(user_msg) + len(reply)
+                }
+            })
+
+        # 结束标志
+        writer.write(b"data: [DONE]\n\n")
+        await writer.drain()
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """处理单个 HTTP 客户端连接"""
         peer = writer.get_extra_info('peername')
@@ -1516,7 +1608,8 @@ class YBDaemon:
                 writer.close()
                 return
 
-            # ── 多轮对话处理 ──
+            # ── 参数提取 ──
+            stream = req_body.get('stream', False)
             messages = req_body.get('messages', [])
             if not messages:
                 resp = self._http_response(400, 'Bad Request', {'error': 'No messages'})
@@ -1657,55 +1750,55 @@ class YBDaemon:
                     except (json.JSONDecodeError, TypeError, AttributeError):
                         pass
 
-                if tool_calls:
-                    # 工具调用：返回 tool_calls 格式
-                    resp_body = {
-                        'id': f'chatcmpl-{uuid.uuid4().hex}',
-                        'object': 'chat.completion',
-                        'created': int(time.time()),
-                        'model': 'yuanbao',
-                        'choices': [{
-                            'index': 0,
-                            'message': {
-                                'role': 'assistant',
-                                'content': None,
-                                'tool_calls': tool_calls
-                            },
-                            'finish_reason': 'tool_calls'
-                        }],
-                        'usage': {
-                            'prompt_tokens': len(user_msg),
-                            'completion_tokens': len(reply),
-                            'total_tokens': len(user_msg) + len(reply)
-                        }
-                    }
-                    logger.info(f"工具调用成功: "
-                                f"{json.dumps(tool_calls, ensure_ascii=False)[:100]}")
+                if stream:
+                    await self._handle_sse_response(writer, reply, tool_calls, user_msg)
                 else:
-                    # 普通文本回复
-                    resp_body = {
-                        'id': f'chatcmpl-{uuid.uuid4().hex}',
-                        'object': 'chat.completion',
-                        'created': int(time.time()),
-                        'model': 'yuanbao',
-                        'choices': [{
-                            'index': 0,
-                            'message': {
-                                'role': 'assistant',
-                                'content': reply
-                            },
-                            'finish_reason': 'stop'
-                        }],
-                        'usage': {
-                            'prompt_tokens': len(user_msg),
-                            'completion_tokens': len(reply),
-                            'total_tokens': len(user_msg) + len(reply)
+                    if tool_calls:
+                        resp_body = {
+                            'id': f'chatcmpl-{uuid.uuid4().hex}',
+                            'object': 'chat.completion',
+                            'created': int(time.time()),
+                            'model': 'yuanbao',
+                            'choices': [{
+                                'index': 0,
+                                'message': {
+                                    'role': 'assistant',
+                                    'content': None,
+                                    'tool_calls': tool_calls
+                                },
+                                'finish_reason': 'tool_calls'
+                            }],
+                            'usage': {
+                                'prompt_tokens': len(user_msg),
+                                'completion_tokens': len(reply),
+                                'total_tokens': len(user_msg) + len(reply)
+                            }
                         }
-                    }
-                    logger.info(f"回复成功: {reply[:60]}")
-
-                resp = self._http_response(200, 'OK', resp_body)
-                writer.write(resp)
+                        logger.info(f"工具调用成功: "
+                                    f"{json.dumps(tool_calls, ensure_ascii=False)[:100]}")
+                    else:
+                        resp_body = {
+                            'id': f'chatcmpl-{uuid.uuid4().hex}',
+                            'object': 'chat.completion',
+                            'created': int(time.time()),
+                            'model': 'yuanbao',
+                            'choices': [{
+                                'index': 0,
+                                'message': {
+                                    'role': 'assistant',
+                                    'content': reply
+                                },
+                                'finish_reason': 'stop'
+                            }],
+                            'usage': {
+                                'prompt_tokens': len(user_msg),
+                                'completion_tokens': len(reply),
+                                'total_tokens': len(user_msg) + len(reply)
+                            }
+                        }
+                        logger.info(f"回复成功: {reply[:60]}")
+                    resp = self._http_response(200, 'OK', resp_body)
+                    writer.write(resp)
             except TimeoutError:
                 resp = self._http_response(504, 'Gateway Timeout',
                                            {'error': '元宝回复超时'})
